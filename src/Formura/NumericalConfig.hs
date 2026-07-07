@@ -192,6 +192,10 @@ convertConfig s s0 sf nc = do
               | maybe False (any (<1)) (cfg ^. icMPIShape) = Left $ ConfigException "the element of mpi_shape should be a positive integer"
               | maybe False (\ft -> ft `mod` nt /= 0) (cfg ^. icFilterInterval) = Left $ ConfigException "the filter interval is a multiple of temporal blocking interval"
               | maybe False (any (/=0)) ms = Left $ ConfigException "Inconsistent config"
+              | (case cfg ^. icBlockingType of
+                   TemporalBlocking gpb _ nti -> any (< 2*s*nti) gpb
+                   NoBlocking -> False)
+                = Left $ ConfigException "grid_per_block must be at least 2*sleeve*temporal_blocking_interval in every axis (smaller blocks are swallowed by the temporal-blocking walls and silently zero out the state)"
               | length (cfg ^. icBoundary) /= length (cfg ^. icGridPerNode) = Left $ ConfigException "boundary should list one entry per axis"
               | any (/= BCPeriodic) (cfg ^. icBoundary) && cfg ^. icBlockingType /= NoBlocking = Left $ ConfigException "non-periodic boundaries currently require temporal blocking to be disabled (omit grid_per_block and temporal_blocking_interval)"
               | any (/= BCPeriodic) (cfg ^. icBoundary) && maybe False (any (> 1)) (cfg ^. icMPIShape) = Left $ ConfigException "non-periodic boundaries currently require mpi_shape [1,...]"
