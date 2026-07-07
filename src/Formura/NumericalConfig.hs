@@ -29,6 +29,7 @@ data NumericalConfig = NumericalConfig
   , _ncFilterInterval :: Maybe Int
   , _ncMPIShape :: Maybe (Vec Int)
   , _ncWithOmp :: Maybe Int
+  , _ncBoundary :: Maybe (Vec String)
   } deriving (Eq, Ord, Read, Show, Typeable, Data)
 
 makeClassy ''NumericalConfig
@@ -79,6 +80,23 @@ data BlockingType = NoBlocking
                       }
   deriving (Eq, Ord, Read, Show, Typeable, Data)
 
+-- | Per-axis boundary condition.  The default is periodic (torus), which is
+-- the only behavior Formura had before.  Non-periodic axes are generated as
+-- an anchored (drift-free) NoBlocking path with ghost slabs filled locally.
+data BoundaryCondition = BCPeriodic
+                       | BCMirror         -- ^ Neumann: ghost mirrors the interior
+                       | BCFixed Double   -- ^ Dirichlet: ghost holds a constant
+  deriving (Eq, Ord, Read, Show, Typeable, Data)
+
+parseBoundaryCondition :: String -> Either ConfigException BoundaryCondition
+parseBoundaryCondition w = case words w of
+  ["periodic"]  -> Right BCPeriodic
+  ["mirror"]    -> Right BCMirror
+  ["fixed", v]  -> case reads v of
+                     [(x, "")] -> Right (BCFixed x)
+                     _         -> Left $ ConfigException $ "invalid fixed boundary value: " ++ v
+  _ -> Left $ ConfigException $ "unknown boundary condition: '" ++ w ++ "' (expected: periodic | mirror | fixed <value>)"
+
 data InternalConfig = InternalConfig
   { _icLengthPerNode :: [Scientific]
   , _icGridPerNode :: [Int]
@@ -90,6 +108,7 @@ data InternalConfig = InternalConfig
   , _icFilterInterval :: Maybe Int
   , _icMPIShape :: Maybe [Int]
   , _icWithOmp :: Int
+  , _icBoundary :: [BoundaryCondition]
   } deriving (Eq, Ord, Read, Show, Typeable, Data)
 
 makeClassy ''InternalConfig
@@ -106,11 +125,16 @@ defaultInternalConfig = InternalConfig
   , _icFilterInterval = Nothing
   , _icMPIShape = Nothing
   , _icWithOmp = 0
+  , _icBoundary = []
   }
 
 convertConfig :: Int -> Maybe Int -> Maybe Int -> NumericalConfig -> Either ConfigException InternalConfig
-convertConfig s s0 sf nc = check ic
+convertConfig s s0 sf nc = do
+  bcs <- traverse parseBoundaryCondition
+           (maybe (replicate dim "periodic") toList (nc ^. ncBoundary))
+  check (ic bcs)
   where
+    dim = length (toList (nc ^. ncGridPerNode))
     nt = fromMaybe 1 (nc ^. ncTemporalBlockingInterval)
     totalGrids = (nc ^. ncGridPerNode) + pure (2*s*nt)
     bt = case (nc ^. ncGridPerBlock) of
@@ -121,7 +145,7 @@ convertConfig s s0 sf nc = check ic
               Just nt -> let bpn = liftVec2 (div) totalGrids gpb
                           in TemporalBlocking (toList gpb) (toList bpn) nt
     ms = liftVec2 (mod) totalGrids <$> (nc ^. ncGridPerBlock)
-    ic = InternalConfig
+    ic bcs = InternalConfig
           { _icLengthPerNode = toList $ nc ^. ncLengthPerNode
           , _icGridPerNode = toList $ nc ^. ncGridPerNode
           , _icSpaceInterval = toList $ (fmap (toRealFloat @Double) $ nc ^. ncLengthPerNode) / (fmap fromIntegral $ nc ^. ncGridPerNode)
@@ -132,6 +156,7 @@ convertConfig s s0 sf nc = check ic
           , _icFilterInterval = nc ^. ncFilterInterval
           , _icMPIShape = toList <$> nc ^. ncMPIShape
           , _icWithOmp = fromMaybe 0 $ nc ^. ncWithOmp
+          , _icBoundary = bcs
           }
     -- 値が制約を満たすか確認
     check :: InternalConfig -> Either ConfigException InternalConfig
@@ -140,6 +165,9 @@ convertConfig s s0 sf nc = check ic
               | maybe False (any (<1)) (cfg ^. icMPIShape) = Left $ ConfigException "the element of mpi_shape should be a positive integer"
               | maybe False (\ft -> ft `mod` nt /= 0) (cfg ^. icFilterInterval) = Left $ ConfigException "the filter interval is a multiple of temporal blocking interval"
               | maybe False (any (/=0)) ms = Left $ ConfigException "Inconsistent config"
+              | length (cfg ^. icBoundary) /= length (cfg ^. icGridPerNode) = Left $ ConfigException "boundary should list one entry per axis"
+              | any (/= BCPeriodic) (cfg ^. icBoundary) && cfg ^. icBlockingType /= NoBlocking = Left $ ConfigException "non-periodic boundaries currently require temporal blocking to be disabled (omit grid_per_block and temporal_blocking_interval)"
+              | any (/= BCPeriodic) (cfg ^. icBoundary) && maybe False (any (> 1)) (cfg ^. icMPIShape) = Left $ ConfigException "non-periodic boundaries currently require mpi_shape [1,...]"
               | otherwise = Right cfg
 
 nbuSize :: String -> InternalConfig -> Int

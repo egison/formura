@@ -335,6 +335,13 @@ defFormuraForward = do
 
 noBlocking :: CVariable -> CVariable -> Int -> String -> BuildM ()
 noBlocking buff rslt s kernelName = do
+  bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
+  if all (== BCPeriodic) bcs
+    then noBlockingPeriodic buff rslt s kernelName
+    else noBlockingAnchored buff rslt s kernelName bcs
+
+noBlockingPeriodic :: CVariable -> CVariable -> Int -> String -> BuildM ()
+noBlockingPeriodic buff rslt s kernelName = do
   globalData <- getGlobalData
   axes <- view (omGlobalEnvironment . axesNames)
   dim <- view (omGlobalEnvironment . dimension)
@@ -344,6 +351,42 @@ noBlocking buff rslt s kernelName = do
   -- 1ステップ更新
   call kernelName ([ref buff, ref rslt, "*n"] ++ replicate dim "0")
   for_ axes $ \a -> statement $ printf "n->offset_%s = (n->offset_%s - %d + n->total_grid_%s)%%n->total_grid_%s" a a s a a
+
+-- | Non-periodic boundaries: an anchored, drift-free single-rank path.
+-- The interior is placed symmetrically at +s on every axis, ghost slabs are
+-- filled locally per axis (periodic wrap / mirror / constant), and the
+-- kernel output lands back on the same logical cells, so offsets stay zero
+-- and to_pos_* is the identity.  Corner ghosts become correct because each
+-- axis pass sweeps the full extent of the previous axes' ghosts.
+noBlockingAnchored :: CVariable -> CVariable -> Int -> String -> [BoundaryCondition] -> BuildM ()
+noBlockingAnchored buff rslt s kernelName bcs = do
+  globalData <- getGlobalData
+  dim <- view (omGlobalEnvironment . dimension)
+  ns <- view (omGlobalEnvironment . envNumericalConfig . icGridPerNode)
+  let fullExt = [n + 2*s | n <- ns]
+      slab a lo hi rhsOf = loopWith
+        [ ( if i == a then "g" else "i" ++ show i
+          , if i == a then lo else 0
+          , if i == a then hi else fullExt !! i
+          , 1 )
+        | i <- [0 .. dim-1] ] $ \idx ->
+          stack <>= [ mkIdent f buff idx @= rhsOf f (fromIdx idx) | f <- getFields buff ]
+      atAxis a e comps = toIdx [ if i == a then e else c | (i, c) <- zip [0..] comps ]
+  -- interior anchored at +s on every axis
+  copy globalData buff empty (repeat s)
+  -- ghost slabs
+  for_ (zip [0 ..] (zip ns bcs)) $ \(a, (na, bc)) -> case bc of
+    BCPeriodic -> do
+      slab a 0 s          $ \f comps -> mkIdent f buff (atAxis a ("g+" ++ show na) comps)
+      slab a (na+s) (na+2*s) $ \f comps -> mkIdent f buff (atAxis a ("g-" ++ show na) comps)
+    BCMirror -> do
+      slab a 0 s          $ \f comps -> mkIdent f buff (atAxis a (show (2*s-1) ++ "-g") comps)
+      slab a (na+s) (na+2*s) $ \f comps -> mkIdent f buff (atAxis a (show (2*(na+s)-1) ++ "-g") comps)
+    BCFixed v -> do
+      slab a 0 s          $ \_ _ -> show v
+      slab a (na+s) (na+2*s) $ \_ _ -> show v
+  -- 1ステップ更新(出力は同じ論理セルに戻るため offset は更新しない)
+  call kernelName ([ref buff, ref rslt, "*n"] ++ replicate dim "0")
 
 updateWithTB :: [Int] -> [Int] -> Int -> [(Int,Int)] -> BuildM ()
 updateWithTB gridPerBlock blockPerNode nt boundary = loopWith [("j" ++ show @Int i,l,u,1) | (i,(l,u)) <- zip [1..] boundary] $ \idx -> do
