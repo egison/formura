@@ -428,7 +428,24 @@ mkKernel mmg sleeve args = do
   -- FIX ME
   let outputSize = getSize $ variableType $ args !! 1
       inputSize = map (+ (2*sleeve)) outputSize
-  let rangeTable = calcRange mmg
+  -- Every node that stores to an output variable must use the same range
+  -- (-sleeve, +sleeve) regardless of its own stencil extent.  The kernel
+  -- writes results at the raw loop index while reading inputs at
+  -- idx + toOffset(range), so the range offset is the per-step shift of
+  -- that variable inside the array.  The surrounding machinery (halo
+  -- copies, n->offset_* updates) assumes one uniform shift of `sleeve`
+  -- cells per step for all variables; per-node ranges break that contract
+  -- whenever stencil radii differ between variables (e.g. a pointwise
+  -- update next to a radius-1 update), silently corrupting every
+  -- cross-variable read from the second step on.  Intermediate (non-void)
+  -- nodes keep their own ranges: their consumers compensate via
+  -- toOffset(consumer) - toOffset(producer), which stays non-negative
+  -- because consumer ranges only grow.
+  let globalRange = MMRange { lower = negate sleeve, upper = sleeve }
+      adjustRange k r = case M.lookup k mmg of
+        Just (Node _ (ElemType "void") _) -> globalRange
+        _ -> r
+      rangeTable = M.mapWithKey adjustRange (calcRange mmg)
   axes <- view (omGlobalEnvironment . axesNames)
   -- 中間変数を生成するかどうかを判定する
   -- 型が void なら最後に Store されているはずなので、中間変数を生成しない
