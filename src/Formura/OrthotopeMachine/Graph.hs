@@ -120,20 +120,6 @@ data MMLocation = MMLocation { _mmlOMNodeID :: OMNodeID,  _mmlCursor :: Vec Int}
   deriving(Eq, Ord, Show)
 
 
-mmInstTails :: MMInstruction -> [MMInstF MMNodeID]
-mmInstTails mminst = rets
-  where
-    rets = [_nodeInst nd
-           | nd <- M.elems mminst
-           , let Just (MMLocation omnid2 _) = A.viewMaybe nd
-           , omnid2==omnid ]
-
-    Just (MMLocation omnid _) = A.viewMaybe maxNode
-
-    maxNode :: MicroNode
-    maxNode = snd $ M.findMax mminst
-
-
 type OMNodeType  = Fix OMNodeTypeF
 type OMNodeTypeF = Sum '[ TopTypeF, GridTypeF, ElemTypeF ]
 
@@ -141,8 +127,9 @@ type MicroNodeType  = Fix MicroNodeTypeF
 type MicroNodeTypeF = Sum '[ ElemTypeF ]
 
 
-instance MeetSemiLattice OMNodeType where
+instance Lattice OMNodeType where
   (/\) = semiLatticeOfOMNodeType
+  (\/) = error "OMNodeType join is not used"
 
 semiLatticeOfOMNodeType :: OMNodeType -> OMNodeType -> OMNodeType
 semiLatticeOfOMNodeType a b = case go a b of
@@ -189,6 +176,21 @@ makeLenses ''Node
 
 instance A.Annotated (Node v t) where
   annotation = nodeAnnot
+
+-- Moved below the `makeLenses ''Node` splice so that the
+-- `A.Annotated (Node v t)` instance is visible (GHC 9.x visibility rule).
+mmInstTails :: MMInstruction -> [MMInstF MMNodeID]
+mmInstTails mminst = rets
+  where
+    rets = [_nodeInst nd
+           | nd <- M.elems mminst
+           , let Just (MMLocation omnid2 _) = A.viewMaybe nd
+           , omnid2==omnid ]
+
+    Just (MMLocation omnid _) = A.viewMaybe maxNode
+
+    maxNode :: MicroNode
+    maxNode = snd $ M.findMax mminst
 
 -- instance (Data instType) => Data (Node instType typeType) where
 --   gfoldl (*) z x = x{_nodeInst = gfoldl (*) z (_nodeInst x)}

@@ -41,7 +41,6 @@ library:
   - parsers
   - process
   - QuickCheck
-  - sbv
   - syb
   - temporary
   - tostring

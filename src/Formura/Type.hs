@@ -18,7 +18,8 @@ unitType = ElemType "void"
 
 type ElementalType = Lang '[TopTypeF, ElemTypeF]
 
-instance MeetSemiLattice ElementalType where
+instance Lattice ElementalType where
+  (\/) = error "ElementalType join is not used"
   (ElemType ea) /\ (ElemType eb) =
     case elementTypenameDecode (max (elementTypenameEncode ea) (elementTypenameEncode eb)) of
      "top" -> TopType

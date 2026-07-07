@@ -337,8 +337,9 @@ data Program = Program
 
 makeLenses ''Program
 
-instance MeetSemiLattice TypeExpr where
+instance Lattice TypeExpr where
   (/\) = semiLatticeOfTypeExpr
+  (\/) = error "TypeExpr join is not used"
 
 semiLatticeOfTypeExpr :: TypeExpr -> TypeExpr -> TypeExpr
 semiLatticeOfTypeExpr a b = case go a b of

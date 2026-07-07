@@ -37,7 +37,7 @@ defaultCompilerSyntacticState = CompilerSyntacticState Nothing ""
 -- | The formura compiler monad.
 newtype CompilerMonad r w s a = CompilerMonad
   { runCompilerMonad :: ExceptT CompilerError (RWST r w s IO) a }
-  deriving (Functor, Applicative, Monad,
+  deriving (Functor, Applicative, Monad, MonadFail,
             MonadIO, MonadReader r, MonadState s, MonadWriter w, MonadError CompilerError)
 
 compileErrMsg :: (HasCompilerSyntacticState s, MonadState s m) => P.Err -> m Ppr.Doc
