@@ -30,6 +30,7 @@ data NumericalConfig = NumericalConfig
   , _ncMPIShape :: Maybe (Vec Int)
   , _ncWithOmp :: Maybe Int
   , _ncBoundary :: Maybe (Vec String)
+  , _ncReduces :: Maybe (Vec String)
   } deriving (Eq, Ord, Read, Show, Typeable, Data)
 
 makeClassy ''NumericalConfig
@@ -88,6 +89,28 @@ data BoundaryCondition = BCPeriodic
                        | BCFixed Double   -- ^ Dirichlet: ghost holds a constant
   deriving (Eq, Ord, Read, Show, Typeable, Data)
 
+-- | Global reduction declared in the yaml, e.g.
+--
+--     reduces: [res = absmax d, tot = sum q]
+--
+-- After Formura_Init and after every Formura_Forward the reduction is
+-- evaluated over the whole (distributed) domain, combined with
+-- MPI_Allreduce, and stored in the Formura_Navi field reduce_<name>,
+-- where drivers can use it for convergence tests, diagnostics, and
+-- adaptive control.
+data ReduceOp = RSum | RMax | RMin | RAbsMax
+  deriving (Eq, Ord, Read, Show, Typeable, Data)
+
+parseReduce :: String -> Either ConfigException (String, ReduceOp, String)
+parseReduce w = case words w of
+  [name, "=", op, var] -> case op of
+    "sum"    -> Right (name, RSum, var)
+    "max"    -> Right (name, RMax, var)
+    "min"    -> Right (name, RMin, var)
+    "absmax" -> Right (name, RAbsMax, var)
+    _        -> Left $ ConfigException $ "unknown reduce operator: " ++ op ++ " (expected: sum | max | min | absmax)"
+  _ -> Left $ ConfigException $ "invalid reduce entry: '" ++ w ++ "' (expected: <name> = <op> <variable>)"
+
 parseBoundaryCondition :: String -> Either ConfigException BoundaryCondition
 parseBoundaryCondition w = case words w of
   ["periodic"]  -> Right BCPeriodic
@@ -109,6 +132,7 @@ data InternalConfig = InternalConfig
   , _icMPIShape :: Maybe [Int]
   , _icWithOmp :: Int
   , _icBoundary :: [BoundaryCondition]
+  , _icReduces :: [(String, ReduceOp, String)]
   } deriving (Eq, Ord, Read, Show, Typeable, Data)
 
 makeClassy ''InternalConfig
@@ -126,13 +150,15 @@ defaultInternalConfig = InternalConfig
   , _icMPIShape = Nothing
   , _icWithOmp = 0
   , _icBoundary = []
+  , _icReduces = []
   }
 
 convertConfig :: Int -> Maybe Int -> Maybe Int -> NumericalConfig -> Either ConfigException InternalConfig
 convertConfig s s0 sf nc = do
   bcs <- traverse parseBoundaryCondition
            (maybe (replicate dim "periodic") toList (nc ^. ncBoundary))
-  check (ic bcs)
+  rds <- traverse parseReduce (maybe [] toList (nc ^. ncReduces))
+  check (ic bcs rds)
   where
     dim = length (toList (nc ^. ncGridPerNode))
     nt = fromMaybe 1 (nc ^. ncTemporalBlockingInterval)
@@ -145,7 +171,7 @@ convertConfig s s0 sf nc = do
               Just nt -> let bpn = liftVec2 (div) totalGrids gpb
                           in TemporalBlocking (toList gpb) (toList bpn) nt
     ms = liftVec2 (mod) totalGrids <$> (nc ^. ncGridPerBlock)
-    ic bcs = InternalConfig
+    ic bcs rds = InternalConfig
           { _icLengthPerNode = toList $ nc ^. ncLengthPerNode
           , _icGridPerNode = toList $ nc ^. ncGridPerNode
           , _icSpaceInterval = toList $ (fmap (toRealFloat @Double) $ nc ^. ncLengthPerNode) / (fmap fromIntegral $ nc ^. ncGridPerNode)
@@ -157,6 +183,7 @@ convertConfig s s0 sf nc = do
           , _icMPIShape = toList <$> nc ^. ncMPIShape
           , _icWithOmp = fromMaybe 0 $ nc ^. ncWithOmp
           , _icBoundary = bcs
+          , _icReduces = rds
           }
     -- 値が制約を満たすか確認
     check :: InternalConfig -> Either ConfigException InternalConfig

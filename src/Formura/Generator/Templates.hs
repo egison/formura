@@ -102,10 +102,12 @@ mkNavi = do
                   ++ [("offset_"++a,CInt,"0") | a <- axes]
                   ++ [("length_"++a,CDouble,show l) | (a,l) <- zip axes lengthPerNode]
                   ++ [("total_grid_"++a,CInt,show l) | (a,l) <- zip axes gridPerNode]
+  reduces <- view (omGlobalEnvironment . envNumericalConfig . icReduces)
   return $ [("time_step",CInt,"0")]
         ++ [("lower_"++a,CInt,"0") | a <- axes]
         ++ [("upper_"++a,CInt,show l) | (a,l) <- zip axes gridPerNode]
         ++ [("space_interval_"++a,CDouble,show l) | (a,l) <- zip axes spaceIntervals]
+        ++ [("reduce_"++nm,CDouble,"0.0") | (nm,_,_) <- reduces]
         ++ fs
   where
     r2a x | x == 0 = ""
@@ -248,6 +250,7 @@ defFormuraInit navi = do
 
       call "Formura_Setup" ("*n":replicate dim "0")
       withFirstStep $ \_ -> call "Formura_First_Step" ["n"]
+      genReduces
 
 defFormuraFirstStep :: MMGraph -> BuildM ()
 defFormuraFirstStep g = do
@@ -307,6 +310,7 @@ defFormuraForward = do
         raw $ printf "if (n->time_step %% %d == 0) {" filterInterval
         call "Formura_Filter" ["n"]
         raw $ "}"
+      genReduces
       statement "n->time_step += 1"
     forwardBody (TemporalBlocking gridPerBlock blockPerNode nt) = do
       s <- view (omGlobalEnvironment . envNumericalConfig . icSleeve)
@@ -331,6 +335,7 @@ defFormuraForward = do
         raw $ printf "if (n->time_step %% %d == 0) {" filterInterval
         call "Formura_Filter" ["n"]
         raw $ "}"
+      genReduces
       statement $ "n->time_step += " ++ show nt
 
 noBlocking :: CVariable -> CVariable -> Int -> String -> BuildM ()
@@ -351,6 +356,37 @@ noBlockingPeriodic buff rslt s kernelName = do
   -- 1ステップ更新
   call kernelName ([ref buff, ref rslt, "*n"] ++ replicate dim "0")
   for_ axes $ \a -> statement $ printf "n->offset_%s = (n->offset_%s - %d + n->total_grid_%s)%%n->total_grid_%s" a a s a a
+
+-- | Emit the yaml-declared global reductions: a local accumulation loop over
+-- the interior, an MPI_Allreduce (under MPI), and a store into the
+-- Formura_Navi field reduce_<name>.  Runs after Formura_Init and after every
+-- Formura_Forward, so drivers always see the reduction of the current state.
+genReduces :: BuildM ()
+genReduces = do
+  reduces <- view (omGlobalEnvironment . envNumericalConfig . icReduces)
+  unless (null reduces) $ do
+    axes <- view (omGlobalEnvironment . axesNames)
+    dim <- view (omGlobalEnvironment . dimension)
+    globalData <- getGlobalData
+    let gname = variableName globalData
+        fields = getFields globalData
+        ivs = ["i" ++ show i | i <- [1..dim]]
+        loopsOpen = concat [printf "for (int %s = n->lower_%s; %s < n->upper_%s; %s++) {\n" iv a iv a iv | (iv,a) <- zip ivs axes]
+        loopsClose = concat (replicate dim "}\n")
+        cell v = gname ++ "." ++ v ++ concat ["[" ++ iv ++ "]" | iv <- ivs]
+    for_ reduces $ \(nm, op, var) -> do
+      unless (var `elem` fields) $
+        error $ "reduce target '" ++ var ++ "' is not a state variable (have: " ++ show fields ++ ")"
+      let (ini, upd, mpiOp) = case op of
+            RSum    -> ("0.0",       "acc = acc + " ++ cell var,          "MPI_SUM")
+            RMax    -> ("-INFINITY", "acc = fmax(acc, " ++ cell var ++ ")", "MPI_MAX")
+            RMin    -> ("INFINITY",  "acc = fmin(acc, " ++ cell var ++ ")", "MPI_MIN")
+            RAbsMax -> ("0.0",       "acc = fmax(acc, fabs(" ++ cell var ++ "))", "MPI_MAX")
+      raw $ "{\ndouble acc = " ++ ini ++ ";\n"
+         ++ loopsOpen ++ upd ++ ";\n" ++ loopsClose
+      withMPI $ \_ ->
+        raw $ printf "MPI_Allreduce(MPI_IN_PLACE, &acc, 1, MPI_DOUBLE, %s, n->mpi_world);\n" mpiOp
+      raw $ "n->reduce_" ++ nm ++ " = acc;\n}"
 
 -- | Non-periodic boundaries: an anchored, drift-free single-rank path.
 -- The interior is placed symmetrically at +s on every axis, ghost slabs are
