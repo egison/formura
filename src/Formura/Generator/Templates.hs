@@ -12,6 +12,7 @@ import qualified Data.Map.Strict as M
 import           Data.Maybe (fromJust)
 import           Text.Printf
 
+import qualified Formura.Annotation as A
 import Formura.Generator.Functions
 import Formura.Generator.Types
 import Formura.GlobalEnvironment
@@ -505,6 +506,14 @@ calcRange = M.foldlWithKey (\acc k (Node mi _ _) -> M.insert k (worker mi acc) a
 mkKernel :: MMGraph -> Int -> [CVariable] -> BuildM ()
 mkKernel mmg sleeve args = do
   -- FIX ME
+  bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
+  -- An all-periodic program runs on the shifting frame: the surrounding
+  -- machinery copies the state at 2*sleeve and moves n->offset_* by sleeve
+  -- every step.  Any declared wall anchors the frame instead: the copy
+  -- margin is sleeve and the offsets stay fixed.  The grid-index emission
+  -- below must subtract whichever margin the copies used.
+  let copyMargin | all (== BCPeriodic) bcs = 2*sleeve
+                 | otherwise = sleeve
   let outputSize = getSize $ variableType $ args !! 1
       inputSize = map (+ (2*sleeve)) outputSize
   -- Every node that stores to an output variable must use the same range
@@ -561,9 +570,9 @@ mkKernel mmg sleeve args = do
       mapType' (ElemType "int")      = CInt
       mapType' (ElemType x)          = CRawType x
       mapType' _                     = error "Invalid type"
-  let genMicroInst idx _ _ (Store n x) _ | tmpPrefix `isPrefixOf` n = stack <>= [(n ++ show idx) @= formatNode x]
-                                         | otherwise = stack <>= [(mkIdent n (args !! 1) idx) @= formatNode x]
-      genMicroInst idx rng mmid mi mt =
+  let genMicroInst idx _ _ (Store n x) _ _ | tmpPrefix `isPrefixOf` n = stack <>= [(n ++ show idx) @= formatNode x]
+                                           | otherwise = stack <>= [(mkIdent n (args !! 1) idx) @= formatNode x]
+      genMicroInst idx rng mmid mi mt annot =
         let decl x = declScopedVariable Nothing (mapType' mt) (formatNode mmid) (Just x) >> return ()
         in decl $ case mi of
             (LoadCursorStatic d n) -> mkIdent n (args !! 0) (idx <> (toIdx . toList $ d + pure (toOffset rng)))
@@ -574,10 +583,29 @@ mkKernel mmg sleeve args = do
             (Binop op a b) | op == "**" -> "pow(" ++ formatNode a ++ "," ++ formatNode b ++ ")"
                            | otherwise -> formatNode a ++ op ++ formatNode b
             (Triop _ a b c) -> formatNode a ++ "?" ++ formatNode b ++ ":" ++ formatNode c
-            LoadIndex i -> (fromIdx idx) !! i ++ "+n.offset_" ++ (axes !! i) ++ "+block_offset_" ++ show (i+1)
+            -- The grid index must follow the same displacement as the
+            -- array loads beside it.  A node's reads sit at
+            -- idx + d + toOffset rng in buffers whose slot b holds the
+            -- cell b - copyMargin (+ n.offset on the shifting frame), so
+            -- the cell this iteration evaluates is
+            --   idx + cursor + toOffset rng - copyMargin + n.offset,
+            -- with the Shift cursor of an inlined instance recorded in its
+            -- MMLocation annotation.  Init kernels run at sleeve zero with
+            -- zero-range stores, so their emission stays the historical
+            -- idx + n.offset form.
+            LoadIndex i ->
+              let cursorShift = case A.viewMaybe annot of
+                    Just (MMLocation _ c) -> toList c !! i
+                    Nothing -> 0 :: Int
+                  correction = cursorShift + toOffset rng - copyMargin
+              in (fromIdx idx) !! i
+                 ++ (if correction == 0
+                       then ""
+                       else "+(" ++ show correction ++ ")")
+                 ++ "+n.offset_" ++ (axes !! i) ++ "+block_offset_" ++ show (i+1)
             -- Naryop は廃止かもなので、実装を待つ
             -- Naryop op xs -> undefined
             x -> error $ "Unimplemented for keyword: " ++ show x
   let genMMInst :: MMRange -> MMInstruction -> BuildM ()
-      genMMInst rng mm = loop [s'- toSize rng | s' <- inputSize] $ \idx -> sequence_ [genMicroInst idx rng mmid mi mt | (mmid, Node mi mt _) <- M.toAscList mm]
+      genMMInst rng mm = loop [s'- toSize rng | s' <- inputSize] $ \idx -> sequence_ [genMicroInst idx rng mmid mi mt annot | (mmid, Node mi mt annot) <- M.toAscList mm]
   sequence_ [genMMInst (rangeTable M.! omid) mm | (omid, Node mm _ _) <- M.toAscList mmg']
