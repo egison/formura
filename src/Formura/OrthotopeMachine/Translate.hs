@@ -18,6 +18,7 @@ import           Control.Exception
 import           Control.Lens hiding (at, op)
 import           Control.Monad
 import           "mtl" Control.Monad.Reader hiding (fix)
+import           Data.List (isPrefixOf)
 import           Data.Foldable
 import qualified Data.Map.Lazy as ML
 import qualified Data.Map.Strict as M
@@ -219,6 +220,7 @@ goUniop :: IdentName -> ValueExpr -> GenM ValueExpr
 goUniop op (av :. at) = insert (Uniop op av) at
 goUniop op (f@(FunValue _ _)) =
   return $ FunValue (Ident "x") (Uniop op (Apply (subFix f) (Ident "x")))
+goUniop op (Tuple xs) | "external-call/" `isPrefixOf` op = goNaryop op xs
 goUniop op (Tuple xs) = do
   vs <- traverse (goUniop op) xs
   return $ Tuple vs

@@ -603,8 +603,8 @@ mkKernel mmg sleeve args = do
                        then ""
                        else "+(" ++ show correction ++ ")")
                  ++ "+n.offset_" ++ (axes !! i) ++ "+block_offset_" ++ show (i+1)
-            -- Naryop は廃止かもなので、実装を待つ
-            -- Naryop op xs -> undefined
+            Naryop op xs | Just f <- stripPrefix "external-call/" op ->
+              f ++ "(" ++ intercalate "," (map formatNode xs) ++ ")"
             x -> error $ "Unimplemented for keyword: " ++ show x
   let genMMInst :: MMRange -> MMInstruction -> BuildM ()
       genMMInst rng mm = loop [s'- toSize rng | s' <- inputSize] $ \idx -> sequence_ [genMicroInst idx rng mmid mi mt annot | (mmid, Node mi mt annot) <- M.toAscList mm]
