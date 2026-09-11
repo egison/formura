@@ -450,7 +450,11 @@ updateWithTB gridPerBlock blockPerNode nt boundary = loopWith [("j" ++ show @Int
         stack <>= [mkIdent f buff (idx' <> toIdx [if b then n else 0 | (b,n) <- zip flag gridPerBlock]) @= mkIdent f tmpWall (idx0 >< idx') | f <- (getFields tmpWall), f `elem` (getFields buff)]
       return ()
 --   - 1段更新
-    call "Formura_Step" ([ref buff, ref rslt,"*n"] ++ fromIdx floorOffset)
+--     Every sub-step moves the block's content by the sleeve, while
+--     n->offset_* is advanced only once per Formura_Forward (by s*nt, below).
+--     The grid-index displacement handed to the kernel therefore drops by s
+--     per sub-step; see the LoadIndex emission in mkKernel.
+    call "Formura_Step" ([ref buff, ref rslt,"*n"] ++ [o ++ "-" ++ show s ++ "*it" | o <- fromIdx floorOffset])
 --   - 壁の書き出し
     for_ tmpWalls $ \(flag, gs, tmpWall) -> do
       let idx0 = (toIdx [i | (i,b) <- zip (fromIdx idx) flag, not b]) >< it
@@ -588,21 +592,33 @@ mkKernel mmg sleeve args = do
             -- idx + d + toOffset rng in buffers whose slot b holds the
             -- cell b - copyMargin (+ n.offset on the shifting frame), so
             -- the cell this iteration evaluates is
-            --   idx + cursor + toOffset rng - copyMargin + n.offset,
+            --   idx + cursor + toOffset rng - copyMargin + n.offset + block_offset,
             -- with the Shift cursor of an inlined instance recorded in its
-            -- MMLocation annotation.  Init kernels run at sleeve zero with
-            -- zero-range stores, so their emission stays the historical
-            -- idx + n.offset form.
+            -- MMLocation annotation.  block_offset_* is the displacement of
+            -- the kernel's local frame from the state array: zero on the
+            -- plain path, and under temporal blocking the block's base
+            -- minus sleeve times the sub-step (updateWithTB), because the
+            -- content moves by the sleeve at every sub-step while n.offset
+            -- is advanced once per Formura_Forward.  Init kernels run at
+            -- sleeve zero with zero-range stores, so their emission stays
+            -- the historical idx + n.offset form.  The sum is reduced
+            -- modulo the global grid size exactly as to_pos_* does: on the
+            -- shifting frame the raw sum leaves [0, total) once n.offset
+            -- has wrapped, which would hand a non-periodic coefficient the
+            -- position y + L instead of y.
             LoadIndex i ->
               let cursorShift = case A.viewMaybe annot of
                     Just (MMLocation _ c) -> toList c !! i
                     Nothing -> 0 :: Int
                   correction = cursorShift + toOffset rng - copyMargin
-              in (fromIdx idx) !! i
-                 ++ (if correction == 0
-                       then ""
-                       else "+(" ++ show correction ++ ")")
-                 ++ "+n.offset_" ++ (axes !! i) ++ "+block_offset_" ++ show (i+1)
+                  axis = axes !! i
+                  total = "n.total_grid_" ++ axis
+                  unwrapped = (fromIdx idx) !! i
+                    ++ (if correction == 0
+                          then ""
+                          else "+(" ++ show correction ++ ")")
+                    ++ "+n.offset_" ++ axis ++ "+block_offset_" ++ show (i+1)
+              in "((" ++ unwrapped ++ ")%" ++ total ++ "+" ++ total ++ ")%" ++ total
             Naryop op xs | Just f <- stripPrefix "external-call/" op ->
               f ++ "(" ++ intercalate "," (map formatNode xs) ++ ")"
             x -> error $ "Unimplemented for keyword: " ++ show x
