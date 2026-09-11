@@ -450,11 +450,15 @@ updateWithTB gridPerBlock blockPerNode nt boundary = loopWith [("j" ++ show @Int
         stack <>= [mkIdent f buff (idx' <> toIdx [if b then n else 0 | (b,n) <- zip flag gridPerBlock]) @= mkIdent f tmpWall (idx0 >< idx') | f <- (getFields tmpWall), f `elem` (getFields buff)]
       return ()
 --   - 1段更新
---     Every sub-step moves the block's content by the sleeve, while
---     n->offset_* is advanced only once per Formura_Forward (by s*nt, below).
---     The grid-index displacement handed to the kernel therefore drops by s
---     per sub-step; see the LoadIndex emission in mkKernel.
-    call "Formura_Step" ([ref buff, ref rslt,"*n"] ++ [o ++ "-" ++ show s ++ "*it" | o <- fromIdx floorOffset])
+--     The block frame: the floor holds cells shifted by 2*s*nt (the copy
+--     into tmp_floor above), so buff slot b of this block holds, at
+--     sub-step it, the cell floorOffset + b + it*s - 2*s*nt of the state
+--     array; n->offset_* is advanced only once per Formura_Forward (by
+--     s*nt, below).  The LoadIndex emission in mkKernel assumes slot b
+--     holds cell b - 2*s + block_offset, so the displacement handed to the
+--     kernel is floorOffset + s*(it + 2 - 2*nt): it grows by s per
+--     sub-step and equals floorOffset - s*(nt - 1) at the last one.
+    call "Formura_Step" ([ref buff, ref rslt,"*n"] ++ [o ++ "+" ++ show s ++ "*(it+" ++ show (2 - 2*nt) ++ ")" | o <- fromIdx floorOffset])
 --   - 壁の書き出し
     for_ tmpWalls $ \(flag, gs, tmpWall) -> do
       let idx0 = (toIdx [i | (i,b) <- zip (fromIdx idx) flag, not b]) >< it
@@ -597,9 +601,10 @@ mkKernel mmg sleeve args = do
             -- MMLocation annotation.  block_offset_* is the displacement of
             -- the kernel's local frame from the state array: zero on the
             -- plain path, and under temporal blocking the block's base
-            -- minus sleeve times the sub-step (updateWithTB), because the
-            -- content moves by the sleeve at every sub-step while n.offset
-            -- is advanced once per Formura_Forward.  Init kernels run at
+            -- corrected by the floor copy margin and the sub-step
+            -- (updateWithTB), because the content moves by the sleeve at
+            -- every sub-step while n.offset is advanced once per
+            -- Formura_Forward.  Init kernels run at
             -- sleeve zero with zero-range stores, so their emission stays
             -- the historical idx + n.offset form.  The sum is reduced
             -- modulo the global grid size exactly as to_pos_* does: on the
