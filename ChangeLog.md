@@ -11,6 +11,10 @@
   `test/tb-boundary.sh` checks bit equality with the non-blocked program
   for mixed boundaries, several intervals and block sizes, and sleeves 1
   and 2, including the grid coordinates read inside `step`.
+- Reject temporal blocking when a periodic axis is shorter than the
+  one-sided halo `2*sleeve*temporal_blocking_interval` of a blocked step:
+  the halo is copied from the neighbor's grid, and a shorter axis silently
+  produced wrong values before.
 
 ## version 2.3.2
 

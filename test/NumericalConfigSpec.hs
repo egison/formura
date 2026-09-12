@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module NumericalConfigSpec (spec) where
 
+import Control.Lens (view)
 import qualified Data.ByteString.Char8 as B
 import Data.Either (isLeft)
 import Test.Hspec
@@ -68,6 +69,30 @@ spec = do
                   , _ncReduces = Nothing
                   }
       decodeConfig cfg `shouldBe` (Right cfg')
+  describe "Blocking with walls" $ do
+    let converted b = convertConfig 1 Nothing Nothing NumericalConfig
+          { _ncLengthPerNode = Vec [1.0,1.0,0.4]
+          , _ncGridPerNode = Vec [16,16,4]
+          , _ncMPIShape = Nothing
+          , _ncGridPerBlock = Just (Vec [22,22,10])
+          , _ncTemporalBlockingInterval = Just 3
+          , _ncFilterInterval = Nothing
+          , _ncWithOmp = Nothing
+          , _ncBoundary = Just (Vec b)
+          , _ncReduces = Nothing
+          }
+    it "accepts temporal blocking with walls on a single rank" $ do
+      fmap (view icBlockingType) (converted ["mirror","fixed 0.0","fixed 1.5"])
+        `shouldBe` Right (TemporalBlocking [22,22,10] [1,1,1] 3)
+    it "rejects a periodic axis shorter than the one-sided halo of a blocked step" $ do
+      converted ["mirror","fixed 0.0","periodic"] `shouldSatisfy` isLeft
+    it "accepts the same axis without temporal blocking" $ do
+      let cfg = B.unlines [ "length_per_node: [1.0,1.0,0.4]"
+                          , "grid_per_node: [16,16,4]"
+                          , "boundary: [mirror, fixed 0.0, periodic]"
+                          ]
+      fmap (view icBlockingType) (convertConfig 1 Nothing Nothing =<< decodeConfig cfg)
+        `shouldBe` Right NoBlocking
   describe "Invalid case" $ do
     it "don't exist MUST fields" $ do
       let cfg = B.unlines [ "length_per_node: [1.0]"

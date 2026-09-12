@@ -199,6 +199,10 @@ convertConfig s s0 sf nc = do
                    NoBlocking -> False)
                 = Left $ ConfigException "grid_per_block must be at least 2*sleeve*temporal_blocking_interval in every axis (smaller blocks are swallowed by the temporal-blocking walls and silently zero out the state)"
               | length (cfg ^. icBoundary) /= length (cfg ^. icGridPerNode) = Left $ ConfigException "boundary should list one entry per axis"
+              | (case cfg ^. icBlockingType of
+                   TemporalBlocking _ _ nti -> or [bc == BCPeriodic && n < 2*s*nti | (bc,n) <- zip (cfg ^. icBoundary) (cfg ^. icGridPerNode)]
+                   NoBlocking -> False)
+                = Left $ ConfigException "grid_per_node must be at least 2*sleeve*temporal_blocking_interval on every periodic axis (the one-sided halo of a blocked step is copied from the neighbor's grid)"
               | any (/= BCPeriodic) (cfg ^. icBoundary) && maybe False (any (> 1)) (cfg ^. icMPIShape) = Left $ ConfigException "non-periodic boundaries currently require mpi_shape [1,...]"
               | otherwise = Right cfg
 
