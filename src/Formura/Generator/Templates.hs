@@ -394,15 +394,29 @@ defFormuraForward = do
           -- copy below returns it to the state array, and the offset stays
           -- fixed.  At the walls of the domain the halos are the ghost
           -- cells, written by imposeBoundaries in every block at every
-          -- sub-step.  The highest blocks need the upper halo, so the
-          -- exchange completes before any block runs.
+          -- sub-step.
+          --
+          -- Blocks run from the top corner downward, each borrowing a strip
+          -- from the block above it at every sub-step, so the block order
+          -- is fixed; what can move is the wait.  A block in the upper box
+          -- (every axis in [0, m-1-d), d the number of blocks the low halo
+          -- of that axis covers) reads only floor slots above the low
+          -- halos, directly and through the strips, so it needs only the
+          -- slabs from beside and above: those are placed first, the upper
+          -- box runs while the slabs from below are still in flight, and
+          -- the remaining blocks follow once they have arrived.  This is
+          -- the split of the all-periodic step with a per-axis halo depth.
           let bigS = s*nt
           layouts <- walledLayout True bigS
           copy globalData tmpFloor empty (map haloInterior layouts)
           rs <- isendrecvHalo "tb" layouts globalData
-          waitAndCopyHalo "tb" layouts rs tmpFloor
-          update b0
-          mapM_ update bs
+          let ds = [haloLow l `div` n | (l,n) <- zip layouts gridPerBlock]
+              upperBox = [(0,m-1-d) | (m,d) <- zip blockPerNode ds]
+              rest = [[(if i == j then m-1-d else 0, if i > j then m-1-d else m) | (m,d,i) <- zip3 blockPerNode ds [1..dim]] | j <- [1..dim]]
+          waitAndCopyHaloOn (all (>= 0)) "tb" layouts rs tmpFloor
+          update upperBox
+          waitAndCopyHaloOn (any (< 0)) "tb" layouts rs tmpFloor
+          mapM_ update rest
           copy tmpFloor globalData empty empty
           for_ (zip axes bcs) $ \(a,bc) -> when (bc == BCPeriodic) $
             statement $ printf "n->offset_%s = (n->offset_%s - %d + n->total_grid_%s)%%n->total_grid_%s" a a (s*nt) a a

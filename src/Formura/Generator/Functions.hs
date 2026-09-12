@@ -398,14 +398,22 @@ isendrecvHalo family ls src = do
 -- | Finish the exchange and place each received slab; a slab from a
 -- missing neighbor across a wall is left alone.
 waitAndCopyHalo :: String -> [HaloLayout] -> ([CVariable],[CVariable],[[Int]]) -> CVariable -> BuildM ()
-waitAndCopyHalo family ls (sendReqs,recvReqs,dirs) tgt = do
+waitAndCopyHalo = waitAndCopyHaloOn (const True)
+
+-- | Finish the exchange of the directions the predicate selects and place
+-- their slabs; the other messages stay in flight.  The blocked step with
+-- walls calls this twice, running the blocks that need no slab from below
+-- between the two calls.
+waitAndCopyHaloOn :: ([Int] -> Bool) -> String -> [HaloLayout] -> ([CVariable],[CVariable],[[Int]]) -> CVariable -> BuildM ()
+waitAndCopyHaloOn select family ls (sendReqs,recvReqs,dirs) tgt = do
   gridPerNode <- view (omGlobalEnvironment . envNumericalConfig . icGridPerNode)
   bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
   mmpiShape <- view (omGlobalEnvironment . envNumericalConfig . icMPIShape)
+  let chosen = [(sr,rr,r) | (sr,rr,r) <- zip3 sendReqs recvReqs dirs, select r]
   withMPI $ \_ -> do
-    mapM_ wait sendReqs
-    mapM_ wait recvReqs
-  for_ dirs $ \r -> do
+    mapM_ (\(sr,_,_) -> wait sr) chosen
+    mapM_ (\(_,rr,_) -> wait rr) chosen
+  for_ chosen $ \(_,_,r) -> do
     recvbuf <- getVariable (haloBufName "hrecv" family r)
     let guarded = mmpiShape /= Nothing && or [d /= 0 && bc /= BCPeriodic | (d,bc) <- zip r bcs]
     when guarded $ raw ("if (n->rank_" ++ formatRank r ++ " != MPI_PROC_NULL) {")
