@@ -86,6 +86,22 @@ spec = do
         `shouldBe` Right (TemporalBlocking [22,22,10] [1,1,1] 3)
     it "rejects a periodic axis shorter than the one-sided halo of a blocked step" $ do
       converted ["mirror","fixed 0.0","periodic"] `shouldSatisfy` isLeft
+    let decomposed shape grid b = convertConfig 1 Nothing Nothing NumericalConfig
+          { _ncLengthPerNode = Vec [1.0,1.0,1.0]
+          , _ncGridPerNode = Vec grid
+          , _ncMPIShape = Just (Vec shape)
+          , _ncGridPerBlock = Just (Vec [22,22,22])
+          , _ncTemporalBlockingInterval = Just 3
+          , _ncFilterInterval = Nothing
+          , _ncWithOmp = Nothing
+          , _ncBoundary = Just (Vec b)
+          , _ncReduces = Nothing
+          }
+    it "accepts a decomposed run with walls and temporal blocking" $ do
+      fmap (view icMPIShape) (decomposed [2,1,2] [16,16,16] ["mirror","periodic","fixed 0.0"])
+        `shouldBe` Right (Just [2,1,2])
+    it "rejects a decomposed walled axis shorter than sleeve*interval" $ do
+      decomposed [2,1,1] [2,16,16] ["mirror","periodic","fixed 0.0"] `shouldSatisfy` isLeft
     it "accepts the same axis without temporal blocking" $ do
       let cfg = B.unlines [ "length_per_node: [1.0,1.0,0.4]"
                           , "grid_per_node: [16,16,4]"

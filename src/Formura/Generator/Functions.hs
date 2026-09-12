@@ -7,6 +7,7 @@ module Formura.Generator.Functions where
 import Control.Lens
 import Control.Monad
 import qualified Data.HashMap.Lazy as HM
+import Data.Foldable (for_)
 import Data.Maybe (maybeToList)
 import Data.List (intercalate, sort, nub)
 import Data.Traversable (for)
@@ -310,6 +311,118 @@ waitAndCopyAt open offsets (sendReqs,recvReqs,recvBufs) tgt = do
     mapM_ wait sendReqs
     mapM_ wait recvReqs
   sequence_ [copy recvBuf tgt empty [if d == 1 then 0 else o | (d,o) <- zip b offsets] | (b,recvBuf) <- zip bases recvBufs]
+
+-- | The per-axis halo layout of a frame with walls: the cells received
+-- below and above the interior, and the slot of interior cell 0.
+data HaloLayout = HaloLayout
+  { haloLow :: Int
+  , haloHigh :: Int
+  , haloInterior :: Int
+  } deriving (Eq, Show)
+
+-- | The frame of a program with walls for a halo of h cells: a walled axis
+-- is anchored with h cells on either side; a periodic axis keeps the
+-- shifting frame with 2h cells below when blocked, and is anchored like a
+-- walled axis otherwise.
+walledLayout :: Bool -> Int -> BuildM [HaloLayout]
+walledLayout blocked h = do
+  bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
+  return [ if bc == BCPeriodic && blocked then HaloLayout (2*h) 0 (2*h) else HaloLayout h h h
+         | bc <- bcs ]
+
+-- | Directions a rank receives from: -1 on an axis with a low halo, +1 on
+-- an axis with a high halo, 0 to span the interior.  A direction that
+-- crosses a walled axis needs a neighbor there, so it exists only when
+-- that axis is decomposed.
+haloDirections :: [HaloLayout] -> BuildM [[Int]]
+haloDirections ls = do
+  bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
+  mmpiShape <- view (omGlobalEnvironment . envNumericalConfig . icMPIShape)
+  let ps = maybe (map (const 1) bcs) id mmpiShape
+      choices (l, bc, p) = 0 : [-1 | haloLow l > 0, bc == BCPeriodic || p > 1]
+                            ++ [1 | haloHigh l > 0, bc == BCPeriodic || p > 1]
+  return [r | r <- mapM choices (zip3 ls bcs ps), any (/= 0) r]
+
+slabExtent :: [HaloLayout] -> [Int] -> [Int] -> [Int]
+slabExtent ls ns r = [pick d l n | (d,l,n) <- zip3 r ls ns]
+  where pick d l n | d == 0 = n
+                   | d < 0 = haloLow l
+                   | otherwise = haloHigh l
+
+-- | Where the sender's slab starts in its state array.
+slabSource :: [HaloLayout] -> [Int] -> [Int] -> [Int]
+slabSource ls ns r = [pick d l n | (d,l,n) <- zip3 r ls ns]
+  where pick d l n | d < 0 = n - haloLow l
+                   | otherwise = 0
+
+-- | Where the received slab lands in the receiver's frame.
+slabTarget :: [HaloLayout] -> [Int] -> [Int] -> [Int]
+slabTarget ls ns r = [pick d l n | (d,l,n) <- zip3 r ls ns]
+  where pick d l n | d == 0 = haloInterior l
+                   | d < 0 = 0
+                   | otherwise = haloInterior l + n
+
+haloBufName :: String -> String -> [Int] -> String
+haloBufName kind family r = kind ++ "_buf_" ++ family ++ "_" ++ formatRank r
+
+-- | Declare the send and receive slabs of one halo family.
+defHaloBuffs :: String -> [HaloLayout] -> CType -> BuildM ()
+defHaloBuffs family ls commType = do
+  gridPerNode <- view (omGlobalEnvironment . envNumericalConfig . icGridPerNode)
+  dirs <- haloDirections ls
+  for_ dirs $ \r -> do
+    declLocalVariable (Just "static") (CArray (slabExtent ls gridPerNode r) commType) (haloBufName "hsend" family r) Nothing
+    declLocalVariable (Just "static") (CArray (slabExtent ls gridPerNode r) commType) (haloBufName "hrecv" family r) Nothing
+  return ()
+
+-- | Start the exchange of one halo family: for every direction r a rank
+-- may receive from, it sends the slab that the neighbor at -r needs (as
+-- that neighbor's source at +r) and posts the receive from +r.  Without
+-- MPI the periodic directions wrap by a local copy.
+isendrecvHalo :: String -> [HaloLayout] -> CVariable -> BuildM ([CVariable],[CVariable],[[Int]])
+isendrecvHalo family ls src = do
+  mmpiShape <- view (omGlobalEnvironment . envNumericalConfig . icMPIShape)
+  gridPerNode <- view (omGlobalEnvironment . envNumericalConfig . icGridPerNode)
+  dirs <- haloDirections ls
+  fmap unzip3 $ for dirs $ \r -> do
+    sendbuf <- getVariable (haloBufName "hsend" family r)
+    recvbuf <- getVariable (haloBufName "hrecv" family r)
+    copy src sendbuf (slabSource ls gridPerNode r) empty
+    case mmpiShape of
+      Nothing -> copy sendbuf recvbuf empty empty >> return (error "never eval", error "never eval", r)
+      Just _ -> do
+        sendReq <- sendToRank (map negate r) ("hsend_req_" ++ formatRank r) sendbuf
+        recvReq <- recvFromRank r ("hrecv_req_" ++ formatRank r) recvbuf
+        return (sendReq, recvReq, r)
+
+-- | Finish the exchange and place each received slab; a slab from a
+-- missing neighbor across a wall is left alone.
+waitAndCopyHalo :: String -> [HaloLayout] -> ([CVariable],[CVariable],[[Int]]) -> CVariable -> BuildM ()
+waitAndCopyHalo family ls (sendReqs,recvReqs,dirs) tgt = do
+  gridPerNode <- view (omGlobalEnvironment . envNumericalConfig . icGridPerNode)
+  bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
+  mmpiShape <- view (omGlobalEnvironment . envNumericalConfig . icMPIShape)
+  withMPI $ \_ -> do
+    mapM_ wait sendReqs
+    mapM_ wait recvReqs
+  for_ dirs $ \r -> do
+    recvbuf <- getVariable (haloBufName "hrecv" family r)
+    let guarded = mmpiShape /= Nothing && or [d /= 0 && bc /= BCPeriodic | (d,bc) <- zip r bcs]
+    when guarded $ raw ("if (n->rank_" ++ formatRank r ++ " != MPI_PROC_NULL) {")
+    copy recvbuf tgt empty (slabTarget ls gridPerNode r)
+    when guarded $ raw "}"
+
+sendToRank :: [Int] -> String -> CVariable -> BuildM CVariable
+sendToRank r reqName v = do
+  req <- declScopedVariable Nothing (CRawType "MPI_Request") reqName Nothing
+  call "MPI_Isend" [ref v, "sizeof(" ++ variableName v ++ ")", "MPI_BYTE", "n->rank_" ++ formatRank r, "0", "n->mpi_world", ref req]
+  return req
+
+recvFromRank :: [Int] -> String -> CVariable -> BuildM CVariable
+recvFromRank r reqName v = do
+  req <- declScopedVariable Nothing (CRawType "MPI_Request") reqName Nothing
+  call "MPI_Irecv" [ref v, "sizeof(" ++ variableName v ++ ")", "MPI_BYTE", "n->rank_" ++ formatRank r, "0", "n->mpi_world", ref req]
+  return req
 
 sendTo :: [Int] -> CVariable -> BuildM CVariable
 sendTo b v = do

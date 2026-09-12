@@ -203,7 +203,12 @@ convertConfig s s0 sf nc = do
                    TemporalBlocking _ _ nti -> or [bc == BCPeriodic && n < 2*s*nti | (bc,n) <- zip (cfg ^. icBoundary) (cfg ^. icGridPerNode)]
                    NoBlocking -> False)
                 = Left $ ConfigException "grid_per_node must be at least 2*sleeve*temporal_blocking_interval on every periodic axis (the one-sided halo of a blocked step is copied from the neighbor's grid)"
-              | any (/= BCPeriodic) (cfg ^. icBoundary) && maybe False (any (> 1)) (cfg ^. icMPIShape) = Left $ ConfigException "non-periodic boundaries currently require mpi_shape [1,...]"
+              | (case cfg ^. icBlockingType of
+                   TemporalBlocking _ _ nti -> or [bc /= BCPeriodic && p > 1 && n < s*nti | (bc,n,p) <- zip3 (cfg ^. icBoundary) (cfg ^. icGridPerNode) (fromMaybe (repeat 1) (cfg ^. icMPIShape))]
+                   NoBlocking -> False)
+                = Left $ ConfigException "grid_per_node must be at least sleeve*temporal_blocking_interval on every decomposed non-periodic axis (each neighbor supplies that many cells on either side of a blocked step)"
+              | cfg ^. icBlockingType == NoBlocking && or [bc == BCPeriodic && n < 2*s | (bc,n) <- zip (cfg ^. icBoundary) (cfg ^. icGridPerNode)]
+                = Left $ ConfigException "grid_per_node must be at least 2*sleeve on every periodic axis (the halo of a step is copied from the neighbor's grid)"
               | otherwise = Right cfg
 
 nbuSize :: String -> InternalConfig -> Int

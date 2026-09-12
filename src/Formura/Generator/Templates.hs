@@ -9,7 +9,8 @@ import           Control.Monad
 import           Data.Foldable (for_, toList)
 import           Data.List
 import qualified Data.Map.Strict as M
-import           Data.Maybe (fromJust)
+import           Data.Maybe (fromJust, maybeToList)
+import           Data.Traversable (for)
 import           Text.Printf
 
 import qualified Formura.Annotation as A
@@ -87,22 +88,38 @@ mkNavi = do
   lengthPerNode <- view (omGlobalEnvironment . envNumericalConfig . icLengthPerNode)
   spaceIntervals <- view (omGlobalEnvironment . envNumericalConfig . icSpaceInterval)
   mmpiShape <- view (omGlobalEnvironment . envNumericalConfig . icMPIShape)
+  bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
+  let walled = map (/= BCPeriodic) bcs
+      anyWall = or walled
+      -- The rank across a wall of the domain does not exist: MPI_PROC_NULL
+      -- turns its sends and receives into no-ops, and the edge rank fills
+      -- the ghost cells from the boundary condition instead.
+      rankInit r
+        | or [x /= 0 && w | (x,w) <- zip r walled] =
+            "(" ++ intercalate " && " [ "0 <= i" ++ show i ++ r2a x ++ " && i" ++ show i ++ r2a x ++ " < P" ++ show i
+                                      | (i,x,w) <- zip3 [1..dim] r walled, w, x /= 0 ]
+            ++ ") ? Formura_Encode_rank" ++ rank2arg r ++ " : MPI_PROC_NULL"
+        | otherwise = "Formura_Encode_rank" ++ rank2arg r
   fs <- case mmpiShape of
           Just mpiShape -> do
             bases <- view (omGlobalEnvironment . commBases)
-            let rs = bases ++ [map negate b | b <- bases]
-                ranksTable = [(formatRank r,rank2arg r) | r <- rs ]
+            let rs0 = bases ++ [map negate b | b <- bases]
+                rs | anyWall = rs0 ++ [r | r <- sequence (replicate dim [-1,0,1]), any (/= 0) r, r `notElem` rs0]
+                   | otherwise = rs0
+                ranksTable = [(formatRank r,rankInit r) | r <- rs ]
             return $ [ ("my_rank",CInt,"rank")
                      , ("mpi_world", CRawType "MPI_Comm", "cm")]
-                  ++ [("rank_"++r,CInt,"Formura_Encode_rank"++ag) | (r,ag) <- ranksTable]
+                  ++ [("rank_"++r,CInt,ini) | (r,ini) <- ranksTable]
                   ++ [("offset_"++a,CInt,show l++"*i"++show i) | (a,l,i) <- zip3 axes gridPerNode [1..dim]]
                   ++ [("length_"++a,CDouble,show (l*fromIntegral m)) | (a,l,m) <- zip3 axes lengthPerNode mpiShape]
                   ++ [("total_grid_"++a,CInt,show (l*m)) | (a,l,m) <- zip3 axes gridPerNode mpiShape]
+                  ++ [("pos_"++a,CInt,"i"++show i) | (a,i) <- zip axes [1..dim], anyWall]
           Nothing ->
             return $ [("my_rank",CInt,"0")]
                   ++ [("offset_"++a,CInt,"0") | a <- axes]
                   ++ [("length_"++a,CDouble,show l) | (a,l) <- zip axes lengthPerNode]
                   ++ [("total_grid_"++a,CInt,show l) | (a,l) <- zip axes gridPerNode]
+                  ++ [("pos_"++a,CInt,"0") | a <- axes, anyWall]
   reduces <- view (omGlobalEnvironment . envNumericalConfig . icReduces)
   return $ [("time_step",CInt,"0")]
         ++ [("lower_"++a,CInt,"0") | a <- axes]
@@ -187,6 +204,32 @@ defCommBuffs = do
           r' = formatRank $ map negate b
       declLocalVariable (Just "static") (CArray [if d == 1 then 2*s else n | (d,n) <- zip b gridPerNode] commType) ("send_buf" ++ show s ++ "_" ++ r) Nothing
       declLocalVariable (Just "static") (CArray [if d == 1 then 2*s else n | (d,n) <- zip b gridPerNode] commType) ("recv_buf" ++ show s ++ "_" ++ r') Nothing
+  families <- haloFamilies
+  for_ families $ \(family, ls) -> defHaloBuffs family ls commType
+
+-- | The halo families of a program with walls: the blocked step on the
+-- mixed frame, and the anchored frames of the plain step, the first step,
+-- and the filter (each named by its sleeve).
+haloFamilies :: BuildM [(String, [HaloLayout])]
+haloFamilies = do
+  bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
+  if all (== BCPeriodic) bcs then return [] else do
+    bt <- view (omGlobalEnvironment . envNumericalConfig . icBlockingType)
+    step <- view (omGlobalEnvironment . envNumericalConfig . icSleeve)
+    first <- view (omGlobalEnvironment . envNumericalConfig . icSleeve0)
+    filter' <- view (omGlobalEnvironment . envNumericalConfig . icFilterSleeve)
+    blocked <- case bt of
+      TemporalBlocking _ _ nt -> do
+        ls <- walledLayout True (step*nt)
+        return [("tb", ls)]
+      NoBlocking -> return []
+    -- the anchored frames exchange halos only when the run is decomposed
+    mmpiShape <- view (omGlobalEnvironment . envNumericalConfig . icMPIShape)
+    let decomposed = maybe False ((> 1) . product) mmpiShape
+    anchored <- for [h | decomposed, h <- nub (sort ([step | bt == NoBlocking] ++ maybeToList first ++ maybeToList filter'))] $ \h -> do
+      ls <- walledLayout False h
+      return ("s" ++ show h, ls)
+    return (blocked ++ anchored)
 
 defUtilFunctions :: BuildM ()
 defUtilFunctions = do
@@ -324,34 +367,45 @@ defFormuraForward = do
       bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
       globalData <- getGlobalData
       tmpFloor <- getVariable "tmp_floor"
-      -- A periodic axis runs on the shifting frame: the interior sits at
-      -- 2*s*nt in the floor behind the one-sided halo, the content drifts
-      -- by s per sub-step, and n->offset_* absorbs the drift of s*nt per
-      -- Formura_Forward.  A walled axis is anchored instead.  Its interior
-      -- starts at 2*s*nt - s, so that the ghost cells of the first sub-step
-      -- end exactly at the top of the floor and those of the last sub-step
-      -- still start at or above slot 0; after nt sub-steps the interior has
-      -- drifted to s*nt - s, from where the copy below returns it to the
-      -- state array, and the offset stays zero.  The ghost cells themselves
-      -- are written by imposeBoundaries in every block at every sub-step.
-      let periodic = map (== BCPeriodic) bcs
-          bigS = s*nt
-          interiorAt = [if p then 2*bigS else 2*bigS - s | p <- periodic]
-          backFrom = [if p then 0 else bigS - s | p <- periodic]
-      copy globalData tmpFloor empty interiorAt
-      -- 通信
-      rs <- isendrecvAlong periodic globalData bigS
-      -- 即時計算可能なブロックと通信待ちブロックの分離
+      axes <- view (omGlobalEnvironment . axesNames)
       let b0 = [(0,m-1-d) | (n,m) <- zip gridPerBlock blockPerNode, let d = 2*s*nt `div` n]
           bs = [[(if i == j then m-1-d else 0, if i > j then m-1-d else m) | (n,m,i) <- zip3 gridPerBlock blockPerNode [1..dim], let d = 2*s*nt `div` n] | j <- [1..dim]]
           update = updateWithTB gridPerBlock blockPerNode nt
-      update b0
-      waitAndCopyAt periodic interiorAt rs tmpFloor
-      mapM_ update bs
-      copy tmpFloor globalData backFrom empty
-      axes <- view (omGlobalEnvironment . axesNames)
-      for_ (zip axes periodic) $ \(a,p) -> when p $
-        statement $ printf "n->offset_%s = (n->offset_%s - %d + n->total_grid_%s)%%n->total_grid_%s" a a (s*nt) a a
+      if all (== BCPeriodic) bcs
+        then do
+          copy globalData tmpFloor empty (repeat (2*s*nt))
+          -- 通信
+          rs <- isendrecv globalData (s*nt)
+          -- 即時計算可能なブロックと通信待ちブロックの分離
+          update b0
+          waitAndCopy rs tmpFloor (s*nt)
+          mapM_ update bs
+          copy tmpFloor globalData empty empty
+          for_ axes $ \a -> statement $ printf "n->offset_%s = (n->offset_%s - %d + n->total_grid_%s)%%n->total_grid_%s" a a (s*nt) a a
+        else do
+          -- A periodic axis runs on the shifting frame: the interior sits at
+          -- 2*s*nt in the floor behind the one-sided halo, the content
+          -- drifts by s per sub-step, and n->offset_* absorbs the drift of
+          -- s*nt per Formura_Forward.  A walled axis is anchored instead:
+          -- its interior starts at s*nt with s*nt cells of the lower
+          -- neighbor below and of the upper neighbor above (the cone of
+          -- dependence of nt sub-steps), computed redundantly and discarded;
+          -- after nt sub-steps the interior has drifted back to slot 0, the
+          -- copy below returns it to the state array, and the offset stays
+          -- fixed.  At the walls of the domain the halos are the ghost
+          -- cells, written by imposeBoundaries in every block at every
+          -- sub-step.  The highest blocks need the upper halo, so the
+          -- exchange completes before any block runs.
+          let bigS = s*nt
+          layouts <- walledLayout True bigS
+          copy globalData tmpFloor empty (map haloInterior layouts)
+          rs <- isendrecvHalo "tb" layouts globalData
+          waitAndCopyHalo "tb" layouts rs tmpFloor
+          update b0
+          mapM_ update bs
+          copy tmpFloor globalData empty empty
+          for_ (zip axes bcs) $ \(a,bc) -> when (bc == BCPeriodic) $
+            statement $ printf "n->offset_%s = (n->offset_%s - %d + n->total_grid_%s)%%n->total_grid_%s" a a (s*nt) a a
       withFilter $ \_ -> do
         filterInterval <- fromJust <$> view (omGlobalEnvironment . envNumericalConfig . icFilterInterval)
         raw $ printf "if (n->time_step %% %d == 0) {" filterInterval
@@ -410,18 +464,22 @@ genReduces = do
         raw $ printf "MPI_Allreduce(MPI_IN_PLACE, &acc, 1, MPI_DOUBLE, %s, n->mpi_world);\n" mpiOp
       raw $ "n->reduce_" ++ nm ++ " = acc;\n}"
 
--- | Non-periodic boundaries: an anchored, drift-free single-rank path.
--- The interior is placed symmetrically at +s on every axis, ghost slabs are
--- filled locally per axis (periodic wrap / mirror / constant), and the
--- kernel output lands back on the same logical cells, so offsets stay zero
--- and to_pos_* is the identity.  Corner ghosts become correct because each
--- axis pass sweeps the full extent of the previous axes' ghosts.
+-- | Non-periodic boundaries: an anchored, drift-free path.  The interior is
+-- placed symmetrically at +s on every axis, ghost slabs are filled per axis
+-- (periodic wrap / mirror / constant, or received from the neighbor rank),
+-- and the kernel output lands back on the same logical cells, so offsets
+-- stay fixed and to_pos_* is the identity on the rank's origin.  Corner
+-- ghosts become correct because each axis pass sweeps the full extent of
+-- the previous axes' ghosts.
 noBlockingAnchored :: CVariable -> CVariable -> Int -> String -> [BoundaryCondition] -> BuildM ()
 noBlockingAnchored buff rslt s kernelName bcs = do
   globalData <- getGlobalData
   dim <- view (omGlobalEnvironment . dimension)
   ns <- view (omGlobalEnvironment . envNumericalConfig . icGridPerNode)
-  let fullExt = [n + 2*s | n <- ns]
+  mmpiShape <- view (omGlobalEnvironment . envNumericalConfig . icMPIShape)
+  axes <- view (omGlobalEnvironment . axesNames)
+  let decomposed = maybe False ((> 1) . product) mmpiShape
+      fullExt = [n + 2*s | n <- ns]
       slab a lo hi rhsOf = loopWith
         [ ( if i == a then "g" else "i" ++ show i
           , if i == a then lo else 0
@@ -432,17 +490,28 @@ noBlockingAnchored buff rslt s kernelName bcs = do
       atAxis a e comps = toIdx [ if i == a then e else c | (i, c) <- zip [0..] comps ]
   -- interior anchored at +s on every axis
   copy globalData buff empty (repeat s)
+  -- A decomposed run receives the halos of every axis from its neighbors
+  -- (periodic axes wrap through the rank encoding); only the ranks at the
+  -- walls of the domain fill ghost slabs there.  A single rank fills all
+  -- slabs locally.
+  when decomposed $ do
+    let layouts = [HaloLayout s s s | _ <- bcs]
+    rs <- isendrecvHalo ("s" ++ show s) layouts globalData
+    waitAndCopyHalo ("s" ++ show s) layouts rs buff
+  let atLow a = "n->pos_" ++ axes !! a ++ " == 0"
+      atHigh a = "n->pos_" ++ axes !! a ++ " == " ++ maybe "0" (\ps -> show (ps !! a - 1)) mmpiShape
+      edge cond body = if decomposed then raw ("if (" ++ cond ++ ") {") >> body >> raw "}" else body
   -- ghost slabs
   for_ (zip [0 ..] (zip ns bcs)) $ \(a, (na, bc)) -> case bc of
-    BCPeriodic -> do
+    BCPeriodic -> unless decomposed $ do
       slab a 0 s          $ \f comps -> mkIdent f buff (atAxis a ("g+" ++ show na) comps)
       slab a (na+s) (na+2*s) $ \f comps -> mkIdent f buff (atAxis a ("g-" ++ show na) comps)
     BCMirror -> do
-      slab a 0 s          $ \f comps -> mkIdent f buff (atAxis a (show (2*s-1) ++ "-g") comps)
-      slab a (na+s) (na+2*s) $ \f comps -> mkIdent f buff (atAxis a (show (2*(na+s)-1) ++ "-g") comps)
+      edge (atLow a) $ slab a 0 s          $ \f comps -> mkIdent f buff (atAxis a (show (2*s-1) ++ "-g") comps)
+      edge (atHigh a) $ slab a (na+s) (na+2*s) $ \f comps -> mkIdent f buff (atAxis a (show (2*(na+s)-1) ++ "-g") comps)
     BCFixed v -> do
-      slab a 0 s          $ \_ _ -> show v
-      slab a (na+s) (na+2*s) $ \_ _ -> show v
+      edge (atLow a) $ slab a 0 s          $ \_ _ -> show v
+      edge (atHigh a) $ slab a (na+s) (na+2*s) $ \_ _ -> show v
   -- 1ステップ更新(出力は同じ論理セルに戻るため offset は更新しない)
   call kernelName ([ref buff, ref rslt, "*n"] ++ replicate dim "0")
 
@@ -481,9 +550,10 @@ updateWithTB gridPerBlock blockPerNode nt boundary = loopWith [("j" ++ show @Int
 --     holds cell b - 2*s + block_offset, so the displacement handed to the
 --     kernel is floorOffset + s*(it + 2 - 2*nt): it grows by s per
 --     sub-step and equals floorOffset - s*(nt - 1) at the last one.  A
---     walled axis stores its interior s slots lower in the floor and its
---     kernel margin is s instead of 2*s, so the same displacement applies.
-    call "Formura_Step" ([ref buff, ref rslt,"*n"] ++ [o ++ "+" ++ show s ++ "*(it+" ++ show (2 - 2*nt) ++ ")" | o <- fromIdx floorOffset])
+--     walled axis stores its interior at s*nt and its kernel margin is s,
+--     so its displacement is floorOffset + s*(it + 1 - nt).
+    bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
+    call "Formura_Step" ([ref buff, ref rslt,"*n"] ++ [o ++ "+" ++ show s ++ "*(it+" ++ show (if bc == BCPeriodic then 2 - 2*nt else 1 - nt) ++ ")" | (o,bc) <- zip (fromIdx floorOffset) bcs])
 --   - 壁の書き出し
     for_ tmpWalls $ \(flag, gs, tmpWall) -> do
       let idx0 = (toIdx [i | (i,b) <- zip (fromIdx idx) flag, not b]) >< it
@@ -495,7 +565,7 @@ updateWithTB gridPerBlock blockPerNode nt boundary = loopWith [("j" ++ show @Int
 
 -- | Under temporal blocking a walled axis keeps its ghost cells inside the
 -- block buffers like any other cell: at sub-step it, slot b of a block
--- holds cell floorOffset + b - interiorAt + s*it, so the ghost cells -s..-1
+-- holds cell floorOffset + b - s*nt + s*it, so the ghost cells -s..-1
 -- and N..N+s-1 sit on slots that move down by s per sub-step.  Before its
 -- kernel runs, every block overwrites the ghost slots that fall into its
 -- buffer (own cells and walls alike) with the boundary values: the
@@ -512,6 +582,8 @@ imposeBoundaries :: [Int] -> [Int] -> Int -> CVariable -> BuildM ()
 imposeBoundaries gridPerBlock blockPerNode nt buff = do
   bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
   s <- view (omGlobalEnvironment . envNumericalConfig . icSleeve)
+  axes <- view (omGlobalEnvironment . axesNames)
+  mmpiShape <- view (omGlobalEnvironment . envNumericalConfig . icMPIShape)
   ns <- view (omGlobalEnvironment . envNumericalConfig . icGridPerNode)
   dim <- view (omGlobalEnvironment . dimension)
   let ext = [n + 2*s | n <- gridPerBlock]
@@ -533,7 +605,7 @@ imposeBoundaries gridPerBlock blockPerNode nt buff = do
     _ -> do
       let extA = ext !! a
           -- slot of interior cell 0 in this block's buffer at sub-step it
-          base = printf "(%d + %d*j%d - %d*it)" (2*bigS - s - nb*(mb-1)) nb (a+1) s :: String
+          base = printf "(%d + %d*j%d - %d*it)" (bigS - nb*(mb-1)) nb (a+1) s :: String
           ghost :: String -> String -> String
           ghost slot source =
             case bc of
@@ -541,10 +613,15 @@ imposeBoundaries gridPerBlock blockPerNode nt buff = do
                              (sweep a (assign a slot (const (show v))))
               _ -> printf "if (%s && %s) {\n%s}\n" (inRange slot extA) (inRange source extA)
                              (sweep a (assign a slot (\f -> mkIdent f buff (at a source))))
+      -- only the ranks at the walls of the domain hold ghost cells there
+      let axisName = axes !! a
+          atLow = "n->pos_" ++ axisName ++ " == 0"
+          atHigh = "n->pos_" ++ axisName ++ " == " ++ maybe "0" (\ps -> show (ps !! a - 1)) mmpiShape
       raw $ "{\nconst int base = " ++ base ++ ";\n"
          ++ printf "for (int g = 0; g < %d; g++) {\n" s
          ++ printf "const int lo = base - 1 - g; const int los = base + g;\nconst int hi = base + %d + g; const int his = base + %d - 1 - g;\n" na na
-         ++ ghost "lo" "los" ++ ghost "hi" "his"
+         ++ "if (" ++ atLow ++ ") {\n" ++ ghost "lo" "los" ++ "}\n"
+         ++ "if (" ++ atHigh ++ ") {\n" ++ ghost "hi" "his" ++ "}\n"
          ++ "}\n}"
 
 -- | Per-axis displacement between a kernel's input buffer and the cells it

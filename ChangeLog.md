@@ -11,6 +11,14 @@
   `test/tb-boundary.sh` checks bit equality with the non-blocked program
   for mixed boundaries, several intervals and block sizes, and sleeves 1
   and 2, including the grid coordinates read inside `step`.
+- Decomposed runs (`mpi_shape` with more than one rank) on domains with
+  walls, with and without temporal blocking.  A walled axis exchanges
+  halos on both sides with its neighbor ranks; the rank across a wall of
+  the domain is `MPI_PROC_NULL`, and the ranks at the walls fill the ghost
+  cells from the boundary condition (`pos_<axis>` in `Formura_Navi` gives
+  the rank position).  `test/mpi-boundary.sh` checks bit equality with the
+  single-rank program for decompositions of one to three axes, with and
+  without blocking; it needs `mpicc` and `mpirun`.
 - Reject temporal blocking when a periodic axis is shorter than the
   one-sided halo `2*sleeve*temporal_blocking_interval` of a blocked step:
   the halo is copied from the neighbor's grid, and a shorter axis silently
