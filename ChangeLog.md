@@ -1,4 +1,17 @@
 # Changelog for formura
+## unreleased
+
+- Temporal blocking on domains with walls: `grid_per_block` and
+  `temporal_blocking_interval` are accepted together with `mirror` and
+  `fixed` boundaries (single rank).  A walled axis stays anchored: its
+  interior is placed at `2*sleeve*interval - sleeve` in the floor, every
+  block overwrites the ghost cells that fall into its buffer with the
+  boundary values before each sub-step kernel, and the state is re-anchored
+  when the floor is copied back.  Periodic axes keep the shifting frame.
+  `test/tb-boundary.sh` checks bit equality with the non-blocked program
+  for mixed boundaries, several intervals and block sizes, and sleeves 1
+  and 2, including the grid coordinates read inside `step`.
+
 ## version 2.3.2
 
 - Add install.sh

@@ -82,8 +82,10 @@ data BlockingType = NoBlocking
   deriving (Eq, Ord, Read, Show, Typeable, Data)
 
 -- | Per-axis boundary condition.  The default is periodic (torus), which is
--- the only behavior Formura had before.  Non-periodic axes are generated as
--- an anchored (drift-free) NoBlocking path with ghost slabs filled locally.
+-- the only behavior Formura had before.  Non-periodic axes are anchored
+-- (drift-free) with ghost cells filled locally: as ghost slabs of the input
+-- buffer without temporal blocking, and as per-sub-step overwrites of the
+-- block buffers under temporal blocking (see imposeBoundaries).
 data BoundaryCondition = BCPeriodic
                        | BCMirror         -- ^ Neumann: ghost mirrors the interior
                        | BCFixed Double   -- ^ Dirichlet: ghost holds a constant
@@ -197,7 +199,6 @@ convertConfig s s0 sf nc = do
                    NoBlocking -> False)
                 = Left $ ConfigException "grid_per_block must be at least 2*sleeve*temporal_blocking_interval in every axis (smaller blocks are swallowed by the temporal-blocking walls and silently zero out the state)"
               | length (cfg ^. icBoundary) /= length (cfg ^. icGridPerNode) = Left $ ConfigException "boundary should list one entry per axis"
-              | any (/= BCPeriodic) (cfg ^. icBoundary) && cfg ^. icBlockingType /= NoBlocking = Left $ ConfigException "non-periodic boundaries currently require temporal blocking to be disabled (omit grid_per_block and temporal_blocking_interval)"
               | any (/= BCPeriodic) (cfg ^. icBoundary) && maybe False (any (> 1)) (cfg ^. icMPIShape) = Left $ ConfigException "non-periodic boundaries currently require mpi_shape [1,...]"
               | otherwise = Right cfg
 

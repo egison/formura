@@ -259,7 +259,8 @@ defFormuraFirstStep g = do
   buff <- getVariable "first_input"
   rslt <- getVariable "first_output"
   s <- fromJust <$> view (omGlobalEnvironment . envNumericalConfig . icSleeve0)
-  defLocalFunction "Formura_First_Step_Kernel" ([(CPtr $ variableType buff, "buff"), (CPtr $ variableType rslt, "rslt"),(CRawType "Formura_Navi", "n")] ++ blockOffset) CVoid (mkKernel g s)
+  margins <- kernelMargins False s
+  defLocalFunction "Formura_First_Step_Kernel" ([(CPtr $ variableType buff, "buff"), (CPtr $ variableType rslt, "rslt"),(CRawType "Formura_Navi", "n")] ++ blockOffset) CVoid (mkKernel g s margins)
   defLocalFunction "Formura_First_Step" [(CRawType "Formura_Navi *", "n")] CVoid $ \_ ->
       noBlocking buff rslt s "Formura_First_Step_Kernel"
 
@@ -269,7 +270,8 @@ defFormuraFilter g = do
   buff <- getVariable "filter_input"
   rslt <- getVariable "filter_output"
   s <- fromJust <$> view (omGlobalEnvironment . envNumericalConfig . icFilterSleeve)
-  defLocalFunction "Formura_Filter_Kernel" ([(CPtr $ variableType buff, "buff"), (CPtr $ variableType rslt, "rslt"),(CRawType "Formura_Navi", "n")] ++ blockOffset) CVoid (mkKernel g s)
+  margins <- kernelMargins False s
+  defLocalFunction "Formura_Filter_Kernel" ([(CPtr $ variableType buff, "buff"), (CPtr $ variableType rslt, "rslt"),(CRawType "Formura_Navi", "n")] ++ blockOffset) CVoid (mkKernel g s margins)
   defLocalFunction "Formura_Filter" [(CRawType "Formura_Navi *", "n")] CVoid $ \_ ->
       noBlocking buff rslt s "Formura_Filter_Kernel"
 
@@ -281,7 +283,8 @@ defFormuraSetup = do
     setupBody = do
       globalData <- getGlobalData
       mmg <- view omInitGraph
-      mkKernel mmg 0 [globalData,globalData]
+      margins <- kernelMargins False 0
+      mkKernel mmg 0 margins [globalData,globalData]
 
 defFormuraStep :: BuildM ()
 defFormuraStep = do
@@ -293,8 +296,10 @@ defFormuraStep = do
     stepBody :: [CVariable] -> BuildM ()
     stepBody args = do
       s <- view (omGlobalEnvironment . envNumericalConfig . icSleeve)
+      bt <- view (omGlobalEnvironment . envNumericalConfig . icBlockingType)
+      margins <- kernelMargins (bt /= NoBlocking) s
       mmg <- view omStepGraph
-      mkKernel mmg s args
+      mkKernel mmg s margins args
 
 defFormuraForward :: BuildM ()
 defFormuraForward = do
@@ -316,21 +321,37 @@ defFormuraForward = do
     forwardBody (TemporalBlocking gridPerBlock blockPerNode nt) = do
       s <- view (omGlobalEnvironment . envNumericalConfig . icSleeve)
       dim <- view (omGlobalEnvironment . dimension)
+      bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
       globalData <- getGlobalData
       tmpFloor <- getVariable "tmp_floor"
-      copy globalData tmpFloor empty (repeat (2*s*nt))
+      -- A periodic axis runs on the shifting frame: the interior sits at
+      -- 2*s*nt in the floor behind the one-sided halo, the content drifts
+      -- by s per sub-step, and n->offset_* absorbs the drift of s*nt per
+      -- Formura_Forward.  A walled axis is anchored instead.  Its interior
+      -- starts at 2*s*nt - s, so that the ghost cells of the first sub-step
+      -- end exactly at the top of the floor and those of the last sub-step
+      -- still start at or above slot 0; after nt sub-steps the interior has
+      -- drifted to s*nt - s, from where the copy below returns it to the
+      -- state array, and the offset stays zero.  The ghost cells themselves
+      -- are written by imposeBoundaries in every block at every sub-step.
+      let periodic = map (== BCPeriodic) bcs
+          bigS = s*nt
+          interiorAt = [if p then 2*bigS else 2*bigS - s | p <- periodic]
+          backFrom = [if p then 0 else bigS - s | p <- periodic]
+      copy globalData tmpFloor empty interiorAt
       -- 通信
-      rs <- isendrecv globalData (s*nt)
+      rs <- isendrecvAlong periodic globalData bigS
       -- 即時計算可能なブロックと通信待ちブロックの分離
       let b0 = [(0,m-1-d) | (n,m) <- zip gridPerBlock blockPerNode, let d = 2*s*nt `div` n]
           bs = [[(if i == j then m-1-d else 0, if i > j then m-1-d else m) | (n,m,i) <- zip3 gridPerBlock blockPerNode [1..dim], let d = 2*s*nt `div` n] | j <- [1..dim]]
           update = updateWithTB gridPerBlock blockPerNode nt
       update b0
-      waitAndCopy rs tmpFloor (s*nt)
+      waitAndCopyAt periodic interiorAt rs tmpFloor
       mapM_ update bs
-      copy tmpFloor globalData empty empty
+      copy tmpFloor globalData backFrom empty
       axes <- view (omGlobalEnvironment . axesNames)
-      for_ axes $ \a -> statement $ printf "n->offset_%s = (n->offset_%s - %d + n->total_grid_%s)%%n->total_grid_%s" a a (s*nt) a a
+      for_ (zip axes periodic) $ \(a,p) -> when p $
+        statement $ printf "n->offset_%s = (n->offset_%s - %d + n->total_grid_%s)%%n->total_grid_%s" a a (s*nt) a a
       withFilter $ \_ -> do
         filterInterval <- fromJust <$> view (omGlobalEnvironment . envNumericalConfig . icFilterInterval)
         raw $ printf "if (n->time_step %% %d == 0) {" filterInterval
@@ -449,6 +470,8 @@ updateWithTB gridPerBlock blockPerNode nt boundary = loopWith [("j" ++ show @Int
       loop gs $ \idx' ->
         stack <>= [mkIdent f buff (idx' <> toIdx [if b then n else 0 | (b,n) <- zip flag gridPerBlock]) @= mkIdent f tmpWall (idx0 >< idx') | f <- (getFields tmpWall), f `elem` (getFields buff)]
       return ()
+--   - 壁つき軸のゴーストセルを境界条件で上書き
+    imposeBoundaries gridPerBlock blockPerNode nt buff
 --   - 1段更新
 --     The block frame: the floor holds cells shifted by 2*s*nt (the copy
 --     into tmp_floor above), so buff slot b of this block holds, at
@@ -457,7 +480,9 @@ updateWithTB gridPerBlock blockPerNode nt boundary = loopWith [("j" ++ show @Int
 --     s*nt, below).  The LoadIndex emission in mkKernel assumes slot b
 --     holds cell b - 2*s + block_offset, so the displacement handed to the
 --     kernel is floorOffset + s*(it + 2 - 2*nt): it grows by s per
---     sub-step and equals floorOffset - s*(nt - 1) at the last one.
+--     sub-step and equals floorOffset - s*(nt - 1) at the last one.  A
+--     walled axis stores its interior s slots lower in the floor and its
+--     kernel margin is s instead of 2*s, so the same displacement applies.
     call "Formura_Step" ([ref buff, ref rslt,"*n"] ++ [o ++ "+" ++ show s ++ "*(it+" ++ show (2 - 2*nt) ++ ")" | o <- fromIdx floorOffset])
 --   - 壁の書き出し
     for_ tmpWalls $ \(flag, gs, tmpWall) -> do
@@ -467,6 +492,71 @@ updateWithTB gridPerBlock blockPerNode nt boundary = loopWith [("j" ++ show @Int
       return ()
 -- - 床の書き出し
   copy rslt tmpFloor empty floorOffset
+
+-- | Under temporal blocking a walled axis keeps its ghost cells inside the
+-- block buffers like any other cell: at sub-step it, slot b of a block
+-- holds cell floorOffset + b - interiorAt + s*it, so the ghost cells -s..-1
+-- and N..N+s-1 sit on slots that move down by s per sub-step.  Before its
+-- kernel runs, every block overwrites the ghost slots that fall into its
+-- buffer (own cells and walls alike) with the boundary values: the
+-- constant of a fixed boundary, or the mirror image of the interior taken
+-- from the same buffer.  The block that updates a wall-adjacent interior
+-- cell always holds both the ghosts and their mirror sources, because its
+-- reads extend s past its update range on either side and that range is s
+-- inside its buffer; a mirror source outside the buffer therefore occurs
+-- only in blocks whose updates next to that wall are discarded, and the
+-- slot is left alone.  The walls saved after the kernel carry the imposed
+-- values to the next block.  Each axis sweeps the full extent of the
+-- others, so corner ghosts follow the same axis order as without blocking.
+imposeBoundaries :: [Int] -> [Int] -> Int -> CVariable -> BuildM ()
+imposeBoundaries gridPerBlock blockPerNode nt buff = do
+  bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
+  s <- view (omGlobalEnvironment . envNumericalConfig . icSleeve)
+  ns <- view (omGlobalEnvironment . envNumericalConfig . icGridPerNode)
+  dim <- view (omGlobalEnvironment . dimension)
+  let ext = [n + 2*s | n <- gridPerBlock]
+      bigS = s*nt
+      fields = getFields buff
+      sweep :: Int -> String -> String
+      sweep a body =
+        concat [printf "for (int q%d = 0; q%d < %d; q%d++) {\n" i i (ext !! i) i | i <- [0..dim-1], i /= a]
+        ++ body
+        ++ concat (replicate (dim-1) "}\n")
+      at :: Int -> String -> Idx
+      at a slot = toIdx [if i == a then slot else "q" ++ show i | i <- [0..dim-1]]
+      assign :: Int -> String -> (String -> String) -> String
+      assign a slot rhs = concat [mkIdent f buff (at a slot) ++ " = " ++ rhs f ++ ";\n" | f <- fields]
+      inRange :: String -> Int -> String
+      inRange v e = printf "0 <= %s && %s < %d" v v e
+  for_ (zip3 [0..] bcs (zip3 ns gridPerBlock blockPerNode)) $ \(a, bc, (na, nb, mb)) -> case bc of
+    BCPeriodic -> return ()
+    _ -> do
+      let extA = ext !! a
+          -- slot of interior cell 0 in this block's buffer at sub-step it
+          base = printf "(%d + %d*j%d - %d*it)" (2*bigS - s - nb*(mb-1)) nb (a+1) s :: String
+          ghost :: String -> String -> String
+          ghost slot source =
+            case bc of
+              BCFixed v -> printf "if (%s) {\n%s}\n" (inRange slot extA)
+                             (sweep a (assign a slot (const (show v))))
+              _ -> printf "if (%s && %s) {\n%s}\n" (inRange slot extA) (inRange source extA)
+                             (sweep a (assign a slot (\f -> mkIdent f buff (at a source))))
+      raw $ "{\nconst int base = " ++ base ++ ";\n"
+         ++ printf "for (int g = 0; g < %d; g++) {\n" s
+         ++ printf "const int lo = base - 1 - g; const int los = base + g;\nconst int hi = base + %d + g; const int his = base + %d - 1 - g;\n" na na
+         ++ ghost "lo" "los" ++ ghost "hi" "his"
+         ++ "}\n}"
+
+-- | Per-axis displacement between a kernel's input buffer and the cells it
+-- holds, as arranged by the surrounding copies: 2*sleeve on the shifting
+-- frame of an all-periodic program, sleeve on the anchored frame of a
+-- program with walls, and, for the step kernel under temporal blocking with
+-- walls, 2*sleeve on the periodic axes and sleeve on the walled ones.
+kernelMargins :: Bool -> Int -> BuildM [Int]
+kernelMargins blocked sleeve = do
+  bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
+  return [ if bc == BCPeriodic && (blocked || all (== BCPeriodic) bcs) then 2*sleeve else sleeve
+         | bc <- bcs ]
 
 defFormuraFinalize :: BuildM ()
 defFormuraFinalize =
@@ -511,17 +601,14 @@ calcRange = M.foldlWithKey (\acc k (Node mi _ _) -> M.insert k (worker mi acc) a
             go rng (Node (LoadCursor s oid) _ _) = rng <> mergeRange (fromCursor s) (tbl M.! oid)
             go rng _ = rng
 
-mkKernel :: MMGraph -> Int -> [CVariable] -> BuildM ()
-mkKernel mmg sleeve args = do
-  -- FIX ME
-  bcs <- view (omGlobalEnvironment . envNumericalConfig . icBoundary)
+mkKernel :: MMGraph -> Int -> [Int] -> [CVariable] -> BuildM ()
+mkKernel mmg sleeve copyMargins args = do
   -- An all-periodic program runs on the shifting frame: the surrounding
   -- machinery copies the state at 2*sleeve and moves n->offset_* by sleeve
-  -- every step.  Any declared wall anchors the frame instead: the copy
-  -- margin is sleeve and the offsets stay fixed.  The grid-index emission
-  -- below must subtract whichever margin the copies used.
-  let copyMargin | all (== BCPeriodic) bcs = 2*sleeve
-                 | otherwise = sleeve
+  -- every step.  A declared wall anchors its axis instead: the copy margin
+  -- is sleeve and the offset stays fixed.  The grid-index emission below
+  -- must subtract whichever margin the copies used on each axis; the
+  -- caller passes them (kernelMargins).
   let outputSize = getSize $ variableType $ args !! 1
       inputSize = map (+ (2*sleeve)) outputSize
   -- Every node that stores to an output variable must use the same range
@@ -615,7 +702,7 @@ mkKernel mmg sleeve args = do
               let cursorShift = case A.viewMaybe annot of
                     Just (MMLocation _ c) -> toList c !! i
                     Nothing -> 0 :: Int
-                  correction = cursorShift + toOffset rng - copyMargin
+                  correction = cursorShift + toOffset rng - copyMargins !! i
                   axis = axes !! i
                   total = "n.total_grid_" ++ axis
                   unwrapped = (fromIdx idx) !! i

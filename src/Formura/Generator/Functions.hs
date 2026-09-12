@@ -269,8 +269,22 @@ sendrecv src tgt s = do
 
 isendrecv :: CVariable -> Int -> BuildM ([CVariable],[CVariable],[CVariable])
 isendrecv src s = do
-  mmpiShape <- view (omGlobalEnvironment . envNumericalConfig . icMPIShape)
+  dim <- view (omGlobalEnvironment . dimension)
+  isendrecvAlong (replicate dim True) src s
+
+-- | The neighbor directions that cross only the axes flagged True.  A
+-- direction that crosses a walled axis has no neighbor and is skipped.
+exchangeBases :: [Bool] -> BuildM [[Int]]
+exchangeBases open = do
   bases <- view (omGlobalEnvironment . commBases)
+  return [b | b <- bases, and [d == 0 || o | (d,o) <- zip b open]]
+
+-- | Start the halo exchange along the flagged (periodic) axes only.  With
+-- every axis flagged this is the classic exchange.
+isendrecvAlong :: [Bool] -> CVariable -> Int -> BuildM ([CVariable],[CVariable],[CVariable])
+isendrecvAlong open src s = do
+  mmpiShape <- view (omGlobalEnvironment . envNumericalConfig . icMPIShape)
+  bases <- exchangeBases open
   gridPerNode <- view (omGlobalEnvironment . envNumericalConfig . icGridPerNode)
   fmap unzip3 $ for bases $ \b -> do
     sendbuf <- getSendBuf s b
@@ -282,12 +296,20 @@ isendrecv src s = do
     return (sendReq, recvReq, recvbuf)
 
 waitAndCopy :: ([CVariable],[CVariable],[CVariable]) -> CVariable -> Int -> BuildM ()
-waitAndCopy (sendReqs,recvReqs,recvBufs) tgt s = do
-  bases <- view (omGlobalEnvironment . commBases)
+waitAndCopy rs tgt s = do
+  dim <- view (omGlobalEnvironment . dimension)
+  waitAndCopyAt (replicate dim True) (replicate dim (2*s)) rs tgt
+
+-- | Finish the exchange started by 'isendrecvAlong' with the same flags and
+-- place each received halo in front of the interior, which the target
+-- buffer stores at the given per-axis offsets (2*s on the classic frame).
+waitAndCopyAt :: [Bool] -> [Int] -> ([CVariable],[CVariable],[CVariable]) -> CVariable -> BuildM ()
+waitAndCopyAt open offsets (sendReqs,recvReqs,recvBufs) tgt = do
+  bases <- exchangeBases open
   withMPI $ \_ -> do
     mapM_ wait sendReqs
     mapM_ wait recvReqs
-  sequence_ [copy recvBuf tgt empty [if d == 1 then 0 else 2*s | d <- b] | (b,recvBuf) <- zip bases recvBufs]
+  sequence_ [copy recvBuf tgt empty [if d == 1 then 0 else o | (d,o) <- zip b offsets] | (b,recvBuf) <- zip bases recvBufs]
 
 sendTo :: [Int] -> CVariable -> BuildM CVariable
 sendTo b v = do
